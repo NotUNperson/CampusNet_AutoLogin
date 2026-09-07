@@ -1,7 +1,7 @@
 """tray 模块 TrayAnimator 的单元测试。运行：python -m unittest discover tests"""
 import unittest
 
-from campus_net.tray import TrayAnimator
+from campus_net.tray import TrayAnimator, _build_menu
 
 
 class _FakeIcon:
@@ -85,6 +85,30 @@ class TrayAnimatorTests(unittest.TestCase):
         # 已消费，下一 tick 不重复发送
         animator._tick_once(icon)
         self.assertEqual(len(icon.balloons), 1)
+
+
+class BuildMenuTests(unittest.TestCase):
+    """托盘菜单构建：pystray 硬校验 action 函数参数个数（>2 直接 ValueError
+    且托盘线程静默死亡），_build_menu 必须能真实构建成功。"""
+
+    def test_build_menu_succeeds_with_real_actions(self):
+        from campus_net.status import AppStatus, TimerState
+        app_status = AppStatus()
+        timer = TimerState()
+        actions = {
+            'open_dashboard': lambda: None,
+            'open_settings': lambda: None,
+            'trigger_login': lambda: None,
+            'toggle_pause': lambda: None,
+            'timer_extend': lambda: None,
+            'timer_cancel': lambda: None,
+            'set_low_memory': lambda mode: None,
+            'get_low_memory': lambda: 'off',
+            'open_logs': lambda: None,
+            'is_paused': lambda: False,
+        }
+        menu = _build_menu(app_status, actions, timer)
+        self.assertIsNotNone(menu)  # 构造成功即通过（参数签名校验在构造时发生）
 
 
 if __name__ == '__main__':

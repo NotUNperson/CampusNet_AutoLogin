@@ -212,26 +212,35 @@ LOW_MEMORY_OPTIONS = (
 
 
 def _low_memory_menu(actions):
-    """低占用模式子菜单：单选切换，选中态实时反映当前配置。"""
-    items = []
-    for value, label in LOW_MEMORY_OPTIONS:
-        def on_click(_icon=None, _item=None, _value=value):
-            actions['set_low_memory'](_value)
+    """低占用模式子菜单：单选切换，选中态实时反映当前配置。
 
-        def is_checked(item, _value=value):
-            return actions['get_low_memory']() == _value
+    pystray 对 action 有硬校验：函数位置参数超过 2 个直接 ValueError
+    （托盘线程静默死亡）。选项值必须经闭包工厂捕获，不能再用默认参数
+    多带一个值。
+    """
+    def make_on_click(v):
+        def on_click(_icon=None, _item=None):
+            actions['set_low_memory'](v)
+        return on_click
 
-        items.append(pystray.MenuItem(label, on_click, radio=True, checked=is_checked))
-    return pystray.Menu(*items)
+    def make_checked(v):
+        def is_checked(_item=None):
+            return actions['get_low_memory']() == v
+        return is_checked
+
+    return pystray.Menu(*[
+        pystray.MenuItem(label, make_on_click(value), radio=True,
+                         checked=make_checked(value))
+        for value, label in LOW_MEMORY_OPTIONS
+    ])
 
 
-def setup_tray(app_status, actions, bridge, timer=None):
-    """构建托盘图标与菜单并进入消息循环（阻塞，应在后台线程调用）。
+def _build_menu(app_status, actions, timer):
+    """构建托盘右键菜单。
 
-    actions 回调集合由 app.py 提供：open_dashboard / open_settings /
-    trigger_login / toggle_pause / open_logs / timer_extend / timer_cancel /
-    set_low_memory / get_low_memory。
-    左键点击图标触发 default 菜单项（打开看板），右键弹出完整菜单。
+    pystray 对 action 函数有硬校验：位置参数超过 2 个在构造时直接
+    ValueError，且异常发生在托盘线程里只会静默吞掉（-w 模式 stderr
+    不可见）——新增菜单项时务必保持 0/2 参数签名（动态文案用 1 参数）。
     """
     def state_text(_item):
         return "状态：%s" % app_status.snapshot()["state_text"]
@@ -250,7 +259,7 @@ def setup_tray(app_status, actions, bridge, timer=None):
             actions[name]()
         return handler
 
-    menu = pystray.Menu(
+    return pystray.Menu(
         pystray.MenuItem("打开看板", run_action("open_dashboard"), default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(state_text, None, enabled=False),
@@ -266,16 +275,34 @@ def setup_tray(app_status, actions, bridge, timer=None):
         pystray.MenuItem("如何常显托盘图标", _promote_guide_action),
         pystray.MenuItem("退出守护程序", _exit_action),
     )
-    icon = pystray.Icon(ICON_NAME, create_tray_icon_image(), ICON_TITLE, menu)
-    animator = TrayAnimator()
-    bridge.attach(icon, animator)
 
-    def _on_tray_ready(ready_icon):
-        # pystray 自定义 setup 回调：必须自行置可见。动画线程在此之后
-        # 启动，保证所有图标赋值都发生在可见之后——可见前的赋值只会
-        # 静默存图不渲染，曾导致图标永远停留在初始颜色。
-        ready_icon.visible = True
-        threading.Thread(target=animator.run, args=(ready_icon,),
-                         name="tray-anim", daemon=True).start()
 
-    icon.run(setup=_on_tray_ready)
+def setup_tray(app_status, actions, bridge, timer=None):
+    """构建托盘图标与菜单并进入消息循环（阻塞，应在后台线程调用）。
+
+    actions 回调集合由 app.py 提供：open_dashboard / open_settings /
+    trigger_login / toggle_pause / open_logs / timer_extend / timer_cancel /
+    set_low_memory / get_low_memory。
+    左键点击图标触发 default 菜单项（打开看板），右键弹出完整菜单。
+
+    托盘线程的任何异常都不会拖垮守护进程，但会让托盘消失且 -w 模式下
+    stderr 不可见——全程记录日志，托盘失踪时可从日志文件直接定位。
+    """
+    try:
+        menu = _build_menu(app_status, actions, timer)
+        icon = pystray.Icon(ICON_NAME, create_tray_icon_image(), ICON_TITLE, menu)
+        animator = TrayAnimator()
+        bridge.attach(icon, animator)
+
+        def _on_tray_ready(ready_icon):
+            # pystray 自定义 setup 回调：必须自行置可见。动画线程在此之后
+            # 启动，保证所有图标赋值都发生在可见之后——可见前的赋值只会
+            # 静默存图不渲染，曾导致图标永远停留在初始颜色。
+            ready_icon.visible = True
+            logging.info("托盘图标已显示")
+            threading.Thread(target=animator.run, args=(ready_icon,),
+                             name="tray-anim", daemon=True).start()
+
+        icon.run(setup=_on_tray_ready)
+    except Exception:
+        logging.exception("托盘初始化/运行异常（托盘不可用，守护功能不受影响）")

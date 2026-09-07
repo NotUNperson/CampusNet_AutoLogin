@@ -31,6 +31,9 @@ def _own_component_names():
     return {
         'config.ini', 'logs', 'run.py', 'campus_net', 'README.md',
         'requirements.txt', 'build.bat', 'tests', '__pycache__', 'build', 'dist',
+        # 版本管理与配套文档（git 仓库工作副本的固有内容，不算杂项）
+        '.git', '.gitignore', '.zcode',
+        '状态.md', '记录.md', '跨平台规划.md',
     }
 
 
@@ -42,7 +45,7 @@ def _unrelated_items():
         return set()
     return {
         name for name in current_items - _own_component_names()
-        if not name.startswith(ISOLATED_ENV_PREFIX)
+        if not name.startswith(ISOLATED_ENV_PREFIX) and not name.endswith('.spec')
     }
 
 
