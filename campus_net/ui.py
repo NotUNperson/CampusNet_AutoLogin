@@ -290,11 +290,22 @@ class UiApi:
             logging.debug("页面可见标志同步失败（页面未就绪）: %s", exc)
 
     def _stop_page_polling(self, window):
-        """收起/销毁前停掉页面轮询，避免在途请求落到已关闭窗口（仅日志噪音）。"""
-        try:
-            window.evaluate_js('__setUiVisible(false)')
-        except Exception:
-            pass  # 页面未加载完时本就无轮询在跑
+        """收起/销毁前停掉页面轮询，避免在途请求落到已关闭窗口（仅日志噪音）。
+
+        必须异步执行：evaluate_js 的完成回调经 UI 线程的同步上下文派发
+        （内部 Invoke + 信号量等待），而 FormClosing 处理器本身就跑在
+        UI 线程上——在处理器里直接调用会自我死锁（UI 线程等信号量，
+        信号量等 UI 线程泵消息），表现为点击 X 后整个应用卡死。
+        丢到独立线程后任何调用方都不阻塞；窗口若先被销毁，evaluate_js
+        抛错已被捕获忽略。
+        """
+        def _stop():
+            try:
+                window.evaluate_js('__setUiVisible(false)')
+            except Exception:
+                pass  # 页面未加载/窗口已销毁：轮询本就不存在或随页面消亡
+
+        threading.Thread(target=_stop, daemon=True, name='cn-stop-polling').start()
 
     def open_settings(self):
         """打开设置：懒创建（低占用——按模式销毁，打开时重建/重见并取消待销毁）。"""

@@ -237,14 +237,16 @@ class UiApiWindowLifecycleTests(unittest.TestCase):
         self.assertIn('destroy', window.calls)
         self.assertIsNone(self.api._settings_window)
 
-    def test_stop_polling_before_destroy(self):
-        window = self._bind_dashboard()
-        self._set_mode('now')
-        with mock.patch('campus_net.ui.webview') as fake_webview:
-            fake_webview.windows = [object(), window]
-            self.api.close_dashboard()
-        destroy_idx = window.calls.index('destroy')
-        self.assertIn('js:__setUiVisible(false)', window.calls[:destroy_idx])
+    def test_stop_page_polling_is_async_never_blocks_caller(self):
+        # 回归锁：_stop_page_polling 必须在独立线程执行 evaluate_js。
+        # 它会被 FormClosing 处理器在 UI 线程上调用，而 evaluate_js 的
+        # 完成回调要等 UI 线程泵消息——同步调用 = 自我死锁（点 X 全卡死）
+        window = _FakeWindow()
+        landed = threading.Event()
+        window.evaluate_js = lambda script: landed.set()
+        self.api._stop_page_polling(window)
+        self.assertNotIn('js:__setUiVisible(false)', window.calls)  # 调用线程未同步执行
+        self.assertTrue(landed.wait(2))  # 异步线程里已落地
 
     def test_closing_now_mode_user_x_allows_natural_close(self):
         # 用户点 X（非 destroy 触发）：立即模式放行关闭，引用复位
