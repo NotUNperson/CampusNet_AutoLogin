@@ -37,5 +37,36 @@ class WaitApiRaceGuardTests(unittest.TestCase):
             self.assertIn('refreshStatus().catch(() => {})', html)
 
 
+class CheckOverlayTests(unittest.TestCase):
+    """v0.9.8：手动检测反馈改为全页覆盖面板（无 alert/毛玻璃）。
+
+    pending 态无定时器保持到完成；结果 3 秒自动消失；seq 哨兵挡掉
+    旧检测的迟到完成，避免面板被无关完成提前覆盖。
+    """
+
+    def test_both_pages_have_overlay_markup_and_styles(self):
+        for html in (settings_html(), dashboard_html()):
+            self.assertIn('id="check-overlay"', html)
+            self.assertIn('id="check-card"', html)
+            self.assertIn('id="check-spinner"', html)
+            self.assertIn('.check-spinner', html)
+            self.assertIn('@keyframes cn-spin', html)
+            self.assertNotIn('manual-msg', html)
+            self.assertNotIn('showManualMsg', html)
+
+    def test_overlay_state_machine_tokens(self):
+        for html in (settings_html(), dashboard_html()):
+            self.assertIn('checkOverlayPending', html)
+            self.assertIn('checkSeqAtRequest', html)  # seq 哨兵
+            self.assertIn("mc.seq <= checkSeqAtRequest", html)
+            self.assertIn('await waitApi();', html)  # 触发前等 API 注入（首点竞态）
+            self.assertIn(', 3000);', html)  # 结果 3 秒自动消失
+
+    def test_overlay_not_native_alert(self):
+        for html in (settings_html(), dashboard_html()):
+            self.assertNotIn('alert(', html)
+            self.assertNotIn('backdrop-filter', html)  # 不用毛玻璃
+
+
 if __name__ == '__main__':
     unittest.main()

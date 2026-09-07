@@ -76,7 +76,12 @@ _BASE_CSS = """
   .timer-row input[type=time] { width: 120px; }
   .timer-row .lbl { font-size: 13px; color: var(--lbl); flex: none; }
   #timer-msg { margin-top: 6px; font-size: 12px; color: #f59e0b; min-height: 14px; }
-  #manual-msg { margin-top: 6px; font-size: 12px; color: #f59e0b; line-height: 1.5; }
+  #check-overlay { position: fixed; left: 0; top: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, .55); display: none; align-items: center; justify-content: center; z-index: 999; }
+  #check-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px; padding: 26px 34px; text-align: center; box-shadow: 0 12px 36px rgba(0,0,0,.35); min-width: 230px; }
+  .check-spinner { width: 34px; height: 34px; border: 4px solid rgba(59, 130, 246, .25); border-top-color: #3b82f6; border-radius: 50%; animation: cn-spin .9s linear infinite; margin: 0 auto 12px; }
+  @keyframes cn-spin { to { transform: rotate(360deg); } }
+  #check-title { font-size: 15px; font-weight: 600; color: var(--heading); }
+  #check-detail { font-size: 12px; color: var(--muted); margin-top: 6px; }
   p { margin: 6px 0; line-height: 1.7; }
 """
 
@@ -125,7 +130,13 @@ _SETTINGS_HTML = """<!DOCTYPE html>
     <div class="status-row"><span class="dot" id="dot"></span><span id="state-text">加载中...</span></div>
     <div id="state-msg" class="muted" style="margin-top:5px"></div>
     <div class="meta muted"><span id="last-check">上次检测: -</span><span id="counts">成功 0 次 / 失败 0 次</span></div>
-    <div id="manual-msg"></div>
+    <div id="check-overlay">
+      <div id="check-card">
+        <div id="check-spinner" class="check-spinner"></div>
+        <div id="check-title"></div>
+        <div id="check-detail"></div>
+      </div>
+    </div>
     <div class="hint">临时计时器已移至托盘左键的迷你看板中。</div>
   </div>
 
@@ -231,25 +242,78 @@ async function changeTheme(value) {
 const STATE_COLOR = { connected: '#10b981', logging_in: '#3b82f6', logging_out: '#3b82f6',
   portal_blocked: '#ef4444', offline: '#ef4444', paused: '#94a3b8', waiting_config: '#f59e0b' };
 
-// ---- 手动检测反馈（仅展示看板来源；托盘来源走系统气泡） ----
+// ---- 手动检测反馈：全页覆盖面板 ----
+// pending 态无定时器、保持到本次请求的完成到达；结果展示 3 秒后自动消失。
+// checkSeqAtRequest 是 seq 哨兵：点击时已知的最新完成序号，旧检测的迟到
+// 完成（seq 不大于哨兵）不会覆盖/关闭面板。
 let lastManualSeq = 0;
-let manualSeqInit = false;
-let manualMsgTimer = null;
+let manualSeqReady = false;
+let checkHideTimer = null;
+let checkElapsedTimer = null;
+let checkOverlayPending = false;
+let checkSeqAtRequest = null;
 
-function showManualMsg(text, autoHide = true) {
-  const box = document.getElementById('manual-msg');
-  box.textContent = text || '';
-  if (manualMsgTimer) { clearTimeout(manualMsgTimer); manualMsgTimer = null; }
-  if (text && autoHide) { manualMsgTimer = setTimeout(() => { box.textContent = ''; }, 6000); }
+function showCheckOverlay() {
+  const overlay = document.getElementById('check-overlay');
+  if (checkHideTimer) { clearTimeout(checkHideTimer); checkHideTimer = null; }
+  if (checkElapsedTimer) { clearInterval(checkElapsedTimer); checkElapsedTimer = null; }
+  const spinner = document.getElementById('check-spinner');
+  if (spinner) { spinner.style.display = 'block'; }
+  const title = document.getElementById('check-title');
+  title.textContent = '正在检测网络状态…';
+  title.style.color = '';
+  document.getElementById('check-detail').textContent = '已进行 0 秒';
+  overlay.style.display = 'flex';
+  checkOverlayPending = true;
+  const started = Date.now();
+  checkElapsedTimer = setInterval(function () {
+    document.getElementById('check-detail').textContent =
+      '已进行 ' + Math.floor((Date.now() - started) / 1000) + ' 秒';
+  }, 1000);
+}
+
+function showCheckResult(ok, text) {
+  if (checkElapsedTimer) { clearInterval(checkElapsedTimer); checkElapsedTimer = null; }
+  const spinner = document.getElementById('check-spinner');
+  if (spinner) { spinner.style.display = 'none'; }
+  const title = document.getElementById('check-title');
+  title.textContent = text;
+  title.style.color = ok ? 'var(--result-ok)' : '#f59e0b';
+  document.getElementById('check-detail').textContent = '面板将在 3 秒后自动关闭';
+  checkOverlayPending = false;
+  if (checkHideTimer) { clearTimeout(checkHideTimer); checkHideTimer = null; }
+  checkHideTimer = setTimeout(function () {
+    document.getElementById('check-overlay').style.display = 'none';
+    checkHideTimer = null;
+  }, 3000);
 }
 
 function pollManualCheck(s) {
   const mc = s.manual_check;
   if (!mc) return;
-  if (!manualSeqInit) { lastManualSeq = mc.seq; manualSeqInit = true; return; }
+  if (!manualSeqReady) {
+    // 首次见到完成记录：默认作为历史基线。但面板等待中且晚于点击哨兵的
+    // 记录是本次点击的结果——app 刚启动时的第一次检测没有历史基线，
+    // 若一并吞掉，用户的第一次检测永远看不到结果（生产实锤过的 bug）。
+    if (checkOverlayPending && checkSeqAtRequest !== null && mc.seq > checkSeqAtRequest) {
+      lastManualSeq = mc.seq;
+      manualSeqReady = true;
+      const skipped0 = String(mc.text || '').indexOf('跳过') !== -1;
+      showCheckResult(!skipped0, (mc.time ? mc.time + ' · ' : '') + (mc.text || '手动检测完成'));
+      return;
+    }
+    lastManualSeq = mc.seq;
+    manualSeqReady = true;
+    return;
+  }
   if (mc.seq > lastManualSeq) {
     lastManualSeq = mc.seq;
-    if (mc.source === 'dashboard') { showManualMsg(mc.time + ' · ' + mc.text, true); }
+    if (mc.source !== 'dashboard') return;  // 托盘来源走系统气泡
+    if (checkOverlayPending && checkSeqAtRequest !== null && mc.seq <= checkSeqAtRequest) {
+      return;  // 旧检测的迟到完成：不属于本次点击，不覆盖面板
+    }
+    const skipped = String(mc.text || '').indexOf('跳过') !== -1;
+    showCheckResult(!skipped, (mc.time ? mc.time + ' · ' : '') + (mc.text || '手动检测完成'));
   }
 }
 
@@ -307,11 +371,18 @@ async function saveForm() {
 }
 
 async function triggerLogin() {
+  showCheckOverlay();
   try {
+    await waitApi();
+    // 取点击时刻的精确完成哨兵：面板只认晚于该序号的完成，历史不干扰
+    const snapshot = await api().get_status();
+    const seq = snapshot.manual_check ? snapshot.manual_check.seq : 0;
+    checkSeqAtRequest = seq;
+    if (seq > lastManualSeq) { lastManualSeq = seq; }
+    manualSeqReady = manualSeqReady || !!snapshot.manual_check;
     await api().trigger_login();
-    showResult('已触发立即检测，请留意上方状态变化', true);
   } catch (e) {
-    showResult('触发失败：' + e, false);
+    showCheckResult(false, '触发失败：' + e);
   }
 }
 
@@ -386,7 +457,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="status-row"><span class="dot" id="dot"></span><span id="state-text">加载中...</span></div>
     <div id="state-msg" class="muted" style="margin-top:5px"></div>
     <div class="meta muted"><span id="last-check">上次检测: -</span><span id="counts">成功 0 次 / 失败 0 次</span></div>
-    <div id="manual-msg"></div>
+    <div id="check-overlay">
+      <div id="check-card">
+        <div id="check-spinner" class="check-spinner"></div>
+        <div id="check-title"></div>
+        <div id="check-detail"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -457,25 +534,78 @@ async function refreshTheme() {
 const STATE_COLOR = { connected: '#10b981', logging_in: '#3b82f6', logging_out: '#3b82f6',
   portal_blocked: '#ef4444', offline: '#ef4444', paused: '#94a3b8', waiting_config: '#f59e0b' };
 
-// ---- 手动检测反馈（仅展示看板来源；托盘来源走系统气泡） ----
+// ---- 手动检测反馈：全页覆盖面板 ----
+// pending 态无定时器、保持到本次请求的完成到达；结果展示 3 秒后自动消失。
+// checkSeqAtRequest 是 seq 哨兵：点击时已知的最新完成序号，旧检测的迟到
+// 完成（seq 不大于哨兵）不会覆盖/关闭面板。
 let lastManualSeq = 0;
-let manualSeqInit = false;
-let manualMsgTimer = null;
+let manualSeqReady = false;
+let checkHideTimer = null;
+let checkElapsedTimer = null;
+let checkOverlayPending = false;
+let checkSeqAtRequest = null;
 
-function showManualMsg(text, autoHide = true) {
-  const box = document.getElementById('manual-msg');
-  box.textContent = text || '';
-  if (manualMsgTimer) { clearTimeout(manualMsgTimer); manualMsgTimer = null; }
-  if (text && autoHide) { manualMsgTimer = setTimeout(() => { box.textContent = ''; }, 6000); }
+function showCheckOverlay() {
+  const overlay = document.getElementById('check-overlay');
+  if (checkHideTimer) { clearTimeout(checkHideTimer); checkHideTimer = null; }
+  if (checkElapsedTimer) { clearInterval(checkElapsedTimer); checkElapsedTimer = null; }
+  const spinner = document.getElementById('check-spinner');
+  if (spinner) { spinner.style.display = 'block'; }
+  const title = document.getElementById('check-title');
+  title.textContent = '正在检测网络状态…';
+  title.style.color = '';
+  document.getElementById('check-detail').textContent = '已进行 0 秒';
+  overlay.style.display = 'flex';
+  checkOverlayPending = true;
+  const started = Date.now();
+  checkElapsedTimer = setInterval(function () {
+    document.getElementById('check-detail').textContent =
+      '已进行 ' + Math.floor((Date.now() - started) / 1000) + ' 秒';
+  }, 1000);
+}
+
+function showCheckResult(ok, text) {
+  if (checkElapsedTimer) { clearInterval(checkElapsedTimer); checkElapsedTimer = null; }
+  const spinner = document.getElementById('check-spinner');
+  if (spinner) { spinner.style.display = 'none'; }
+  const title = document.getElementById('check-title');
+  title.textContent = text;
+  title.style.color = ok ? 'var(--result-ok)' : '#f59e0b';
+  document.getElementById('check-detail').textContent = '面板将在 3 秒后自动关闭';
+  checkOverlayPending = false;
+  if (checkHideTimer) { clearTimeout(checkHideTimer); checkHideTimer = null; }
+  checkHideTimer = setTimeout(function () {
+    document.getElementById('check-overlay').style.display = 'none';
+    checkHideTimer = null;
+  }, 3000);
 }
 
 function pollManualCheck(s) {
   const mc = s.manual_check;
   if (!mc) return;
-  if (!manualSeqInit) { lastManualSeq = mc.seq; manualSeqInit = true; return; }
+  if (!manualSeqReady) {
+    // 首次见到完成记录：默认作为历史基线。但面板等待中且晚于点击哨兵的
+    // 记录是本次点击的结果——app 刚启动时的第一次检测没有历史基线，
+    // 若一并吞掉，用户的第一次检测永远看不到结果（生产实锤过的 bug）。
+    if (checkOverlayPending && checkSeqAtRequest !== null && mc.seq > checkSeqAtRequest) {
+      lastManualSeq = mc.seq;
+      manualSeqReady = true;
+      const skipped0 = String(mc.text || '').indexOf('跳过') !== -1;
+      showCheckResult(!skipped0, (mc.time ? mc.time + ' · ' : '') + (mc.text || '手动检测完成'));
+      return;
+    }
+    lastManualSeq = mc.seq;
+    manualSeqReady = true;
+    return;
+  }
   if (mc.seq > lastManualSeq) {
     lastManualSeq = mc.seq;
-    if (mc.source === 'dashboard') { showManualMsg(mc.time + ' · ' + mc.text, true); }
+    if (mc.source !== 'dashboard') return;  // 托盘来源走系统气泡
+    if (checkOverlayPending && checkSeqAtRequest !== null && mc.seq <= checkSeqAtRequest) {
+      return;  // 旧检测的迟到完成：不属于本次点击，不覆盖面板
+    }
+    const skipped = String(mc.text || '').indexOf('跳过') !== -1;
+    showCheckResult(!skipped, (mc.time ? mc.time + ' · ' : '') + (mc.text || '手动检测完成'));
   }
 }
 
@@ -533,11 +663,18 @@ async function timerCancel() {
 }
 
 async function triggerLogin() {
-  showManualMsg('检测已触发，正在执行…', false);
+  showCheckOverlay();
   try {
+    await waitApi();
+    // 取点击时刻的精确完成哨兵：面板只认晚于该序号的完成，历史不干扰
+    const snapshot = await api().get_status();
+    const seq = snapshot.manual_check ? snapshot.manual_check.seq : 0;
+    checkSeqAtRequest = seq;
+    if (seq > lastManualSeq) { lastManualSeq = seq; }
+    manualSeqReady = manualSeqReady || !!snapshot.manual_check;
     await api().trigger_login();
   } catch (e) {
-    showManualMsg('触发失败：' + e, true);
+    showCheckResult(false, '触发失败：' + e);
   }
 }
 async function togglePause() { await api().toggle_pause(); }
